@@ -50,6 +50,11 @@ class CarbonClientProtocol(object):
     self.transport.registerProducer(self, streaming=True)
     # Define internal metric names
     self.lastResetTime = time()
+    # Per-connection quality tracking. Counters live on the factory so that
+    # they survive across protocol instances, but they describe this single
+    # TCP connection only: they are re-baselined every time a connection is
+    # established or reset.
+    self.factory.resetConnectionCounters()
     self.destination = self.factory.destination
     self.destinationName = self.factory.destinationName
     self.queuedUntilReady = 'destinations.%s.queuedUntilReady' % self.destinationName
@@ -99,6 +104,7 @@ class CarbonClientProtocol(object):
     self._sendDatapointsNow(datapoints)
     instrumentation.increment(self.sent, len(datapoints))
     instrumentation.increment(self.batchesSent)
+    self.factory.recordSent(len(datapoints))
     self.factory.checkQueue()
 
   def sendQueued(self):
@@ -144,37 +150,52 @@ class CarbonClientProtocol(object):
       self.factory.scheduleSend()
 
   def connectionQualityMonitor(self):
-    """Checks to see if the connection for this factory appears to
-    be delivering stats at a speed close to what we're receiving
-    them at.
+    """Checks whether this single connection is keeping up with the
+    datapoints handed to *this* factory.
 
-    This is open to other measures of connection quality.
+    In pooled-replica mode the check is driven entirely by per-connection
+    counters (accepted vs sent since the last reset window), so the behavior
+    of other replicas or the cluster-wide receive rate can no longer mask a
+    slow connection. Non-pooled mode keeps the historical behaviour of
+    comparing this destination's sent count against the global receive rate
+    over the last instrumentation interval.
 
-    Returns a Bool
-
-    True means that quality is good, OR
-    True means that the total received is less than settings.MIN_RESET_STAT_FLOW
-
-    False means that quality is bad
+    Returns True when quality is good (or there is too little traffic to
+    judge), and False when the connection should be reset.
     """
+    instrumentation.increment(self.slowConnectionReset, 0)
+
+    if settings.DESTINATION_POOL_REPLICAS:
+      return self.pooledConnectionQualityMonitor()
+
     if not settings.USE_RATIO_RESET:
       return True
 
-    if settings.DESTINATION_POOL_REPLICAS:
-        received = self.factory.attemptedRelays
-    else:
-        received = 'metricsReceived'
-
     destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
-    total_received = float(instrumentation.prior_stats.get(received, 0))
-    instrumentation.increment(self.slowConnectionReset, 0)
+    total_received = float(instrumentation.prior_stats.get('metricsReceived', 0))
     if total_received < settings.MIN_RESET_STAT_FLOW:
       return True
 
-    if (destination_sent / total_received) < settings.MIN_RESET_RATIO:
-      return False
-    else:
+    return (destination_sent / total_received) >= settings.MIN_RESET_RATIO
+
+  def pooledConnectionQualityMonitor(self):
+    """Per-connection quality check for DESTINATION_POOL_REPLICAS mode.
+
+    Compares datapoints accepted by this factory since the connection (or
+    its last reset) against those actually written to this socket. The
+    counters describe this connection alone, so neither cluster-wide
+    throughput nor traffic routed to other replicas can mask a slow one.
+    """
+    accepted = float(self.factory.window_accepted)
+    sent = float(self.factory.window_sent)
+
+    if accepted < settings.POOLED_MIN_RESET_STAT_FLOW:
       return True
+
+    if (sent / accepted) < settings.POOLED_MIN_RESET_RATIO:
+      return False
+
+    return True
 
   def resetConnectionForQualityReasons(self, reason):
     """Only re-sets the connection if it's been
@@ -188,6 +209,9 @@ class CarbonClientProtocol(object):
     else:
       self.factory.connectedProtocol.disconnect()
       self.lastResetTime = time()
+      # Start a fresh observation window so the reconnected protocol is
+      # judged on its own performance rather than the old connection's.
+      self.factory.resetConnectionCounters()
       instrumentation.increment(self.slowConnectionReset)
       log.clients("%s:: resetConnectionForQualityReasons: %s" % (self, reason))
 
@@ -244,6 +268,10 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.connectionMade = Deferred()
     self.connectionMade.addCallbacks(self.clientConnectionMade, log.err)
     self.deferSendPending = None
+    # Per-connection accounting. These counters describe the currently
+    # established TCP connection only and are re-baselined whenever a new
+    # connection is made or a slow connection is reset.
+    self.resetConnectionCounters()
     # Define internal metric names
     self.attemptedRelays = 'destinations.%s.attemptedRelays' % self.destinationName
     self.fullQueueDrops = 'destinations.%s.fullQueueDrops' % self.destinationName
@@ -252,6 +280,84 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
 
   def clientProtocol(self):
     raise NotImplementedError()
+
+  def resetConnectionCounters(self):
+    """Re-baseline the per-connection observation window.
+
+    Called on connect and after a quality-driven reset so each connection
+    is judged solely on its own acceptance/send behavior.
+    """
+    now = time()
+    self.window_started = now
+    self.window_accepted = 0
+    self.window_sent = 0
+    # Exponentially smoothed send rate in datapoints per second. Seeded with
+    # None until the first measurable interval elapses.
+    self.send_rate = None
+    self._last_rate_time = now
+    self._last_rate_sent = 0
+
+  def recordAccepted(self, count=1):
+    """Track datapoints handed to this factory on the current connection."""
+    self.window_accepted += count
+
+  def recordSent(self, count):
+    """Track datapoints written to the current connection and update the
+    smoothed send-rate estimate used for backlog-aware replica selection.
+    """
+    self.window_sent += count
+
+    now = time()
+    elapsed = now - self._last_rate_time
+    if elapsed > 0:
+      instant_rate = float(self.window_sent - self._last_rate_sent) / elapsed
+      # Low-pass filter to avoid reacting to a single burst or stall.
+      if self.send_rate is None:
+        self.send_rate = instant_rate
+      else:
+        alpha = 0.3
+        self.send_rate = alpha * instant_rate + (1.0 - alpha) * self.send_rate
+      self._last_rate_time = now
+      self._last_rate_sent = self.window_sent
+
+  @property
+  def isConnected(self):
+    return bool(self.connectedProtocol is not None
+                and getattr(self.connectedProtocol, 'connected', False))
+
+  def estimatedBacklog(self):
+    """Estimate how long (seconds) this connection needs to flush its queue
+    given its observed send rate.
+
+    Disconnected replicas return None so callers can explicitly avoid
+    routing new traffic at them. A connection with no measured rate yet is
+    treated optimistically (zero drain time), which favors fresh
+    connections over proven-slow ones.
+    """
+    if not self.isConnected:
+      return None
+    if not self.queue:
+      return 0.0
+    if not self.send_rate or self.send_rate <= 0:
+      return 0.0
+    return float(self.queueSize) / self.send_rate
+
+  def connectionLoad(self):
+    """Selection score for pooled replica load balancing.
+
+    Returns a ``(backlog_seconds, queue_size)`` tuple suitable for ``min``.
+    The primary key is the projected time this connection needs to flush
+    its queue given its own observed send rate, so two replicas holding the
+    same queue size are no longer treated as equivalent when one drains far
+    more slowly. The instantaneous queue size is retained as a tie-breaker,
+    which also preserves the historical behavior for connections whose send
+    rate has not been measured yet. Disconnected replicas sort last.
+    """
+    backlog = self.estimatedBacklog()
+    if backlog is None:
+      # Disconnected replicas are only a last resort.
+      return (float('inf'), float('inf'))
+    return (backlog, float(self.queueSize))
 
   def scheduleSend(self):
     if self.deferSendPending and self.deferSendPending.active():
@@ -352,6 +458,7 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
   def sendDatapoint(self, metric, datapoint):
     instrumentation.increment(self.attemptedRelays)
     instrumentation.max(self.relayMaxQueueLength, self.queueSize)
+    self.recordAccepted()
     if self.queueSize >= settings.MAX_QUEUE_SIZE:
       if not self.queueFull.called:
         self.queueFull.callback(self.queueSize)
@@ -359,6 +466,7 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
         self.enqueue(metric, datapoint)
       else:
         instrumentation.increment(self.fullQueueDrops)
+        self.window_accepted -= 1
     else:
       self.enqueue(metric, datapoint)
 
@@ -379,6 +487,7 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     with a fixed max size.
     """
     instrumentation.increment(self.attemptedRelays)
+    self.recordAccepted()
     self.enqueue_from_left(metric, datapoint)
 
     if self.connectedProtocol:
@@ -452,6 +561,9 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
         for metric, datapoint in metrics:
             state.events.metricGenerated(metric, datapoint)
         self.queue.clear()
+        # Those metrics were handed to another destination; stop counting
+        # them against this (now removed) connection's quality window.
+        self.window_accepted = max(0, self.window_accepted - len(metrics))
 
   def disconnect(self):
     self.queueEmpty.addCallbacks(lambda result: self.stopConnecting(), log.err)
@@ -660,9 +772,14 @@ class CarbonClientManager(Service):
           # we just put the data into our fake factory / buffer.
           factories.add(self.client_factories[None])
         else:
-          # Else we take the replica with the smallest queue size.
+          # Else we pick the replica with the lightest connection load.
+          # The load is based on the per-connection backlog (queue size
+          # relative to observed send rate) rather than the instantaneous
+          # queue size alone, so a slow replica stops attracting new traffic
+          # and disconnected replicas are only used as a last resort.
           key = d[0:2]  # Take only host:port, not instance.
-          factories.add(min(self.pooled_factories[key], key=lambda f: f.queueSize))
+          pool = self.pooled_factories[key]
+          factories.add(min(pool, key=lambda f: f.connectionLoad()))
     return factories
 
   def sendDatapoint(self, metric, datapoint):

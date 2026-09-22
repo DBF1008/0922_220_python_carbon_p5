@@ -102,6 +102,12 @@ defaults = dict(
   DESTINATION_TRANSPORT="none",
   DESTINATION_SSL_CA=None,
   DESTINATION_POOL_REPLICAS=False,
+  # Minimum number of datapoints a pooled connection must have accepted
+  # before its per-connection send ratio is evaluated for a reset.
+  POOLED_MIN_RESET_STAT_FLOW=1000,
+  # Minimum fraction (sent / accepted) a pooled connection must sustain
+  # within a reset window; below it the single connection is reset.
+  POOLED_MIN_RESET_RATIO=0.9,
   USE_FLOW_CONTROL=True,
   USE_INSECURE_UNPICKLER=False,
   USE_WHITELIST=False,

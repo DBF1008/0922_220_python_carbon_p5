@@ -472,8 +472,11 @@ DESTINATIONS = 127.0.0.1:2004
 # The following example will balance the load between :0 and :1.
 ## DESTINATIONS = foo:2001:0, foo:2001:1
 ## RELAY_METHOD = rules
-# Note: this is currently incompatible with USE_RATIO_RESET which gets
-# disabled if  this option is enabled.
+# When enabled, replica selection uses each connection's real backlog
+# (queue size relative to its observed send rate) rather than the
+# instantaneous queue size alone, and slow connections are reset based on
+# per-connection accepted/sent counters (see POOLED_MIN_RESET_* below),
+# independently of USE_RATIO_RESET.
 # DESTINATIONS_POOL_REPLICAS = False
 
 # When using consistent hashing it sometime makes sense to make
@@ -589,6 +592,15 @@ MIN_RESET_RATIO=0.9
 # below (2*CARBON_METRIC_INTERVAL) + 1 second will result in a lot of
 # reset connections for no good reason.
 MIN_RESET_INTERVAL=121
+
+# When DESTINATION_POOL_REPLICAS is enabled, slow-connection detection uses
+# per-connection counters (datapoints accepted by a single pooled connection
+# versus datapoints actually sent on it) instead of the cluster-wide receive
+# rate used by USE_RATIO_RESET. This means a single slow replica is reset
+# even when the rest of the cluster keeps the overall throughput healthy,
+# and the same MIN_RESET_INTERVAL cooldown applies between resets.
+# POOLED_MIN_RESET_STAT_FLOW=1000
+# POOLED_MIN_RESET_RATIO=0.9
 
 # Enable TCP Keep Alive (http://tldp.org/HOWTO/TCP-Keepalive-HOWTO/overview.html).
 # Default settings will send a probe every 30s. Default is False.
