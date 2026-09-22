@@ -3,6 +3,7 @@ from carbon.client import (
   CarbonPickleClientFactory, CarbonPickleClientProtocol, CarbonLineClientProtocol,
   CarbonClientManager, RelayProcessor
 )
+from carbon import instrumentation
 from carbon.routers import DatapointRouter
 from carbon.tests.util import TestSettings
 from carbon import state
@@ -18,6 +19,7 @@ from twisted.test.proto_helpers import StringTransport
 from mock import Mock, patch
 from pickle import loads as pickle_loads
 from struct import unpack, calcsize
+from time import time
 
 
 INT32_FORMAT = '!I'
@@ -329,3 +331,274 @@ class CarbonClientShutdownDrainTest(TestCase):
     self.assertEqual('regular.metric', factory.queue[1][0])
     # Both remain in queue for orderly drain; no resume triggered.
     self.assertEqual(2, len(factory.queue))
+
+
+class SendRateTrackingTest(TestCase):
+  """Unit tests for the per-connection send rate EWMA and backlog score."""
+
+  def setUp(self):
+    carbon_client.settings = TestSettings()
+    self.router_mock = Mock(spec=DatapointRouter)
+    self.factory = CarbonPickleClientFactory(
+        ('127.0.0.1', 2003, 'a'), self.router_mock)
+
+  def test_send_rate_ewma_and_idle_decay(self):
+    with patch('carbon.client.time') as time_mock:
+      time_mock.return_value = 1000.0
+      self.factory.noteDatapointsSent(100)  # first batch only stamps the clock
+      self.assertEqual(0.0, self.factory.sendRate)
+
+      time_mock.return_value = 1001.0
+      self.factory.noteDatapointsSent(100)  # 100 datapoints over 1 second
+      expected = (1.0 - 0.5 ** 0.1) * 100.0
+      self.assertAlmostEqual(expected, self.factory.sendRate, places=5)
+
+      # One full EWMA window of idle time halves the observed rate.
+      time_mock.return_value = 1011.0
+      self.assertAlmostEqual(expected * 0.5, self.factory.sendRate, places=5)
+
+  def test_send_rate_unknown_before_any_send(self):
+    self.assertEqual(0.0, self.factory.sendRate)
+
+  def test_backlog_score_estimates_drain_time(self):
+    with patch('carbon.client.time') as time_mock:
+      time_mock.return_value = 1000.0
+      self.factory.noteDatapointsSent(1)
+      time_mock.return_value = 1001.0
+      self.factory.noteDatapointsSent(100)
+      for i in range(50):
+        self.factory.enqueue('metric.%d' % i, (0, 1.0))
+      self.assertAlmostEqual(
+          50.0 / self.factory.sendRate, self.factory.backlogScore, places=5)
+
+  def test_backlog_score_floors_unknown_send_rate(self):
+    # Without any observed send rate the score degrades to the queue
+    # size (send rate floor of 1 datapoint/second).
+    for i in range(50):
+      self.factory.enqueue('metric.%d' % i, (0, 1.0))
+    self.assertEqual(50.0, self.factory.backlogScore)
+
+  def test_send_datapoints_now_updates_send_rate(self):
+    protocol = self.factory.buildProtocol(('127.0.0.1', 2003))
+    protocol.makeConnection(StringTransport())
+    self.assertIsNone(self.factory._sendRateUpdated)
+    protocol.sendDatapointsNow([('foo.bar', (1000000000, 1.0))])
+    self.assertIsNotNone(self.factory._sendRateUpdated)
+
+
+class PooledReplicaSelectionTest(TestCase):
+  """Regression tests for backlog-aware replica selection when
+  DESTINATION_POOL_REPLICAS is enabled."""
+
+  def setUp(self):
+    carbon_client.settings = TestSettings()
+    carbon_client.settings.DESTINATION_POOL_REPLICAS = True
+    self.router_mock = Mock(spec=DatapointRouter)
+    with patch('carbon.client.setUpRandomResolver'):
+      self.client_mgr = CarbonClientManager(self.router_mock)
+    self.hostport = ('127.0.0.1', 2003)
+    self.replicas = {}
+    for instance in ('a', 'b', 'c'):
+      dest = self.hostport + (instance,)
+      factory = CarbonPickleClientFactory(dest, self.router_mock)
+      self.replicas[instance] = factory
+      self.client_mgr.client_factories[dest] = factory
+      self.client_mgr.pooled_factories[self.hostport].add(factory)
+    self.router_mock.getDestinations.return_value = [self.hostport + ('a',)]
+
+  def _set_send_rate(self, factory, rate):
+    factory._sendRate = rate
+    factory._sendRateUpdated = time()
+
+  def _enqueue(self, factory, count):
+    for i in range(count):
+      factory.enqueue('metric.%d' % i, (0, 1.0))
+
+  def _selected(self):
+    factories = self.client_mgr.getFactories('some.metric')
+    self.assertEqual(1, len(factories))
+    return factories.pop()
+
+  def test_slow_replica_is_avoided(self):
+    # Replica 'a' is slow: deep backlog and poor observed send rate.
+    self._enqueue(self.replicas['a'], 500)
+    self._set_send_rate(self.replicas['a'], 1.0)
+    self._set_send_rate(self.replicas['b'], 100.0)
+    self._set_send_rate(self.replicas['c'], 100.0)
+    for _ in range(5):
+      self.assertIn(self._selected(), (
+          self.replicas['b'], self.replicas['c']))
+
+  def test_recovered_replica_is_selected_again(self):
+    # 'a' was slow but drained its backlog; the other replicas now
+    # carry some backlog of their own.
+    self._set_send_rate(self.replicas['a'], 100.0)
+    for instance in ('b', 'c'):
+      self._enqueue(self.replicas[instance], 100)
+      self._set_send_rate(self.replicas[instance], 100.0)
+    self.assertIs(self.replicas['a'], self._selected())
+
+  def test_send_rate_breaks_queue_size_ties(self):
+    # Same queue depth: the replica that actually delivers faster has
+    # the lower estimated drain time and must be preferred.
+    self._enqueue(self.replicas['a'], 100)
+    self._enqueue(self.replicas['b'], 100)
+    self._enqueue(self.replicas['c'], 1000)
+    self._set_send_rate(self.replicas['a'], 1.0)
+    self._set_send_rate(self.replicas['b'], 100.0)
+    self._set_send_rate(self.replicas['c'], 100.0)
+    self.assertIs(self.replicas['b'], self._selected())
+
+  def test_replicas_balance_load(self):
+    # With no send-rate information, assigning a datapoint raises the
+    # chosen replica's score, so successive selections rotate through
+    # the pool instead of piling onto a single replica.
+    chosen = []
+    for _ in range(6):
+      factory = self._selected()
+      chosen.append(factory)
+      factory.sendDatapoint('some.metric', (0, 1.0))
+    for replica in self.replicas.values():
+      self.assertEqual(2, chosen.count(replica))
+    for replica in self.replicas.values():
+      if replica.deferSendPending and replica.deferSendPending.active():
+        replica.deferSendPending.cancel()
+
+  def test_no_destination_buffers_to_fake_factory(self):
+    self.router_mock.getDestinations.return_value = []
+    self.assertEqual(
+        {self.client_mgr.client_factories[None]},
+        self.client_mgr.getFactories('some.metric'))
+
+
+class NonPooledGetFactoriesTest(TestCase):
+  """Non-pooled factory resolution must keep its existing semantics."""
+
+  def setUp(self):
+    carbon_client.settings = TestSettings()
+    carbon_client.settings.DESTINATION_POOL_REPLICAS = False
+    self.router_mock = Mock(spec=DatapointRouter)
+    self.client_mgr = CarbonClientManager(self.router_mock)
+    self.dest = ('127.0.0.1', 2003, 'a')
+    self.factory = CarbonPickleClientFactory(self.dest, self.router_mock)
+    self.client_mgr.client_factories[self.dest] = self.factory
+    self.router_mock.getDestinations.return_value = [self.dest]
+
+  def test_returns_factory_for_destination(self):
+    self.assertEqual({self.factory}, self.client_mgr.getFactories('some.metric'))
+
+  def test_buffers_to_fake_factory_when_no_destination(self):
+    self.router_mock.getDestinations.return_value = []
+    self.assertEqual(
+        {self.client_mgr.client_factories[None]},
+        self.client_mgr.getFactories('some.metric'))
+
+
+class PooledConnectionQualityMonitorTest(TestCase):
+  """Regression tests for the per-connection quality model used when
+  DESTINATION_POOL_REPLICAS is enabled."""
+
+  def setUp(self):
+    carbon_client.settings = TestSettings()
+    carbon_client.settings.USE_RATIO_RESET = True
+    carbon_client.settings.DESTINATION_POOL_REPLICAS = True
+    carbon_client.settings.MIN_RESET_STAT_FLOW = 1000
+    carbon_client.settings.MIN_RESET_RATIO = 0.9
+    self.router_mock = Mock(spec=DatapointRouter)
+    self.factory = CarbonPickleClientFactory(
+        ('127.0.0.1', 2003, 'a'), self.router_mock)
+    self.protocol = self.factory.buildProtocol(('127.0.0.1', 2003))
+    self.protocol.makeConnection(StringTransport())
+
+  def tearDown(self):
+    if self.factory.deferSendPending and self.factory.deferSendPending.active():
+      self.factory.deferSendPending.cancel()
+
+  def _enqueue(self, count):
+    for i in range(count):
+      self.factory.enqueue('metric.%d' % i, (0, 1.0))
+
+  def _quality(self, sent):
+    with patch.dict(instrumentation.prior_stats, {self.protocol.sent: sent}):
+      return self.protocol.connectionQualityMonitor()
+
+  def test_healthy_connection_passes(self):
+    self.assertTrue(self._quality(sent=10000))
+
+  def test_recovered_connection_passes(self):
+    # Backlog mostly drained: 5000 sent vs 100 still queued.
+    self._enqueue(100)
+    self.assertTrue(self._quality(sent=5000))
+
+  def test_low_workload_passes(self):
+    # Not enough per-connection flow to judge quality yet.
+    self._enqueue(10)
+    self.assertTrue(self._quality(sent=0))
+
+  def test_slow_connection_fails(self):
+    self._enqueue(2000)
+    self.assertFalse(self._quality(sent=100))
+
+  def test_starved_slow_connection_still_fails(self):
+    # Regression: a slow replica stops being assigned new work, so
+    # assignment-side counters (attemptedRelays) drop to zero and used
+    # to mask the stalled connection.  Its own backlog must still make
+    # it eligible for a reset.
+    self._enqueue(5000)
+    self.assertFalse(self._quality(sent=0))
+
+  def test_send_queued_resets_slow_pooled_connection(self):
+    self._enqueue(2000)
+    self.protocol.lastResetTime = 0
+    with patch.dict(instrumentation.prior_stats, {self.protocol.sent: 10}):
+      self.protocol.sendQueued()
+    self.assertFalse(self.protocol.connected)
+
+  def test_send_queued_keeps_healthy_pooled_connection(self):
+    self._enqueue(100)
+    self.protocol.lastResetTime = 0
+    with patch.dict(instrumentation.prior_stats, {self.protocol.sent: 10000}):
+      self.protocol.sendQueued()
+    self.assertTrue(self.protocol.connected)
+
+
+class NonPooledConnectionQualityMonitorTest(TestCase):
+  """The non-pooled quality model must keep its existing semantics:
+  per-destination sent is compared against cluster-wide metricsReceived
+  and the local queue depth plays no role."""
+
+  def setUp(self):
+    carbon_client.settings = TestSettings()
+    carbon_client.settings.USE_RATIO_RESET = True
+    carbon_client.settings.DESTINATION_POOL_REPLICAS = False
+    carbon_client.settings.MIN_RESET_STAT_FLOW = 1000
+    carbon_client.settings.MIN_RESET_RATIO = 0.9
+    self.router_mock = Mock(spec=DatapointRouter)
+    self.factory = CarbonPickleClientFactory(
+        ('127.0.0.1', 2003, 'a'), self.router_mock)
+    self.protocol = self.factory.buildProtocol(('127.0.0.1', 2003))
+    self.protocol.makeConnection(StringTransport())
+
+  def _quality(self, sent, received):
+    prior = {self.protocol.sent: sent, 'metricsReceived': received}
+    with patch.dict(instrumentation.prior_stats, prior):
+      return self.protocol.connectionQualityMonitor()
+
+  def test_good_ratio_passes(self):
+    self.assertTrue(self._quality(sent=10000, received=10000))
+
+  def test_bad_ratio_fails(self):
+    self.assertFalse(self._quality(sent=100, received=10000))
+
+  def test_queue_depth_is_ignored(self):
+    # A deep local queue must not influence the non-pooled decision.
+    for i in range(5000):
+      self.factory.enqueue('metric.%d' % i, (0, 1.0))
+    self.assertTrue(self._quality(sent=10000, received=10000))
+
+  def test_low_flow_passes(self):
+    self.assertTrue(self._quality(sent=0, received=10))
+
+  def test_ratio_reset_disabled_passes(self):
+    carbon_client.settings.USE_RATIO_RESET = False
+    self.assertTrue(self._quality(sent=0, received=100000))

@@ -40,6 +40,15 @@ if settings.USE_FLOW_CONTROL:
 else:
     SEND_QUEUE_HARD_MAX = settings.MAX_QUEUE_SIZE
 
+# Window (in seconds) for the exponentially-weighted moving average of a
+# connection's observed send rate.  It is used to estimate how fast a
+# pooled replica can drain its own backlog.
+SEND_RATE_EWMA_WINDOW = 10.0
+# Floor (datapoints/second) for the observed send rate so that a
+# connection without recent observations still gets a finite backlog
+# score instead of a division by zero.
+MIN_OBSERVED_SEND_RATE = 1.0
+
 
 class CarbonClientProtocol(object):
 
@@ -99,6 +108,7 @@ class CarbonClientProtocol(object):
     self._sendDatapointsNow(datapoints)
     instrumentation.increment(self.sent, len(datapoints))
     instrumentation.increment(self.batchesSent)
+    self.factory.noteDatapointsSent(len(datapoints))
     self.factory.checkQueue()
 
   def sendQueued(self):
@@ -132,9 +142,10 @@ class CarbonClientProtocol(object):
       return
 
     if not self.connectionQualityMonitor():
-      self.resetConnectionForQualityReasons("Sent: {0}, Received: {1}".format(
+      self.resetConnectionForQualityReasons("Sent: {0}, Received: {1}, Queued: {2}".format(
         instrumentation.prior_stats.get(self.sent, 0),
-        instrumentation.prior_stats.get('metricsReceived', 0)))
+        instrumentation.prior_stats.get('metricsReceived', 0),
+        self.factory.queueSize))
 
     self.sendDatapointsNow(self.factory.takeSomeFromQueue())
     if (self.factory.queueFull.called and queueSize < SEND_QUEUE_LOW_WATERMARK):
@@ -148,26 +159,42 @@ class CarbonClientProtocol(object):
     be delivering stats at a speed close to what we're receiving
     them at.
 
+    With DESTINATION_POOL_REPLICAS the check is tied to this
+    connection's own backlog and send performance: the workload owed
+    to the connection is what it delivered during the last
+    instrumentation interval plus what is still sitting in its own
+    queue.  This keeps a slow replica eligible for a reset even when
+    the replica-selection logic has stopped assigning it new work,
+    and avoids masking a stalled connection behind cluster-wide
+    receive counters.
+
     This is open to other measures of connection quality.
 
     Returns a Bool
 
     True means that quality is good, OR
-    True means that the total received is less than settings.MIN_RESET_STAT_FLOW
+    True means that the measured flow is less than settings.MIN_RESET_STAT_FLOW
 
     False means that quality is bad
     """
     if not settings.USE_RATIO_RESET:
       return True
 
-    if settings.DESTINATION_POOL_REPLICAS:
-        received = self.factory.attemptedRelays
-    else:
-        received = 'metricsReceived'
-
     destination_sent = float(instrumentation.prior_stats.get(self.sent, 0))
-    total_received = float(instrumentation.prior_stats.get(received, 0))
     instrumentation.increment(self.slowConnectionReset, 0)
+
+    if settings.DESTINATION_POOL_REPLICAS:
+      # Per-connection workload: datapoints sent during the last
+      # instrumentation interval plus the datapoints still backlogged
+      # in this connection's own queue.
+      workload = destination_sent + self.factory.queueSize
+      if workload < settings.MIN_RESET_STAT_FLOW:
+        return True
+      if (destination_sent / workload) < settings.MIN_RESET_RATIO:
+        return False
+      return True
+
+    total_received = float(instrumentation.prior_stats.get('metricsReceived', 0))
     if total_received < settings.MIN_RESET_STAT_FLOW:
       return True
 
@@ -244,6 +271,12 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.connectionMade = Deferred()
     self.connectionMade.addCallbacks(self.clientConnectionMade, log.err)
     self.deferSendPending = None
+    # Per-connection send performance tracking.  _sendRate is an EWMA of
+    # datapoints written to the socket per second, decayed over idle
+    # time, so that replica selection and quality monitoring can reason
+    # about this connection's real backlog/drain behaviour.
+    self._sendRate = 0.0
+    self._sendRateUpdated = None
     # Define internal metric names
     self.attemptedRelays = 'destinations.%s.attemptedRelays' % self.destinationName
     self.fullQueueDrops = 'destinations.%s.fullQueueDrops' % self.destinationName
@@ -315,6 +348,43 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
   @property
   def queueSize(self):
     return len(self.queue)
+
+  def noteDatapointsSent(self, count):
+    """Record that `count` datapoints were just written to the socket.
+
+    Maintains an exponentially-weighted moving average of this
+    connection's send throughput (datapoints/second).
+    """
+    now = time()
+    if self._sendRateUpdated is not None:
+      elapsed = now - self._sendRateUpdated
+      if elapsed > 0:
+        decay = 0.5 ** (elapsed / SEND_RATE_EWMA_WINDOW)
+        sample = float(count) / elapsed
+        self._sendRate = decay * self._sendRate + (1.0 - decay) * sample
+    self._sendRateUpdated = now
+
+  @property
+  def sendRate(self):
+    """Observed send rate in datapoints/second, decayed for idle time."""
+    if self._sendRateUpdated is None:
+      return 0.0
+    idle = time() - self._sendRateUpdated
+    if idle <= 0:
+      return self._sendRate
+    return self._sendRate * (0.5 ** (idle / SEND_RATE_EWMA_WINDOW))
+
+  @property
+  def backlogScore(self):
+    """Estimated seconds needed to drain the current queue at this
+    connection's observed send rate.
+
+    Used to select the least-backlogged replica of a destination pool:
+    a slow replica scores high both because its queue grows and because
+    its observed send rate drops, while a recovered replica becomes
+    attractive again as soon as its backlog drains.
+    """
+    return self.queueSize / max(self.sendRate, MIN_OBSERVED_SEND_RATE)
 
   def hasQueuedDatapoints(self):
     return bool(self.queue)
@@ -660,9 +730,11 @@ class CarbonClientManager(Service):
           # we just put the data into our fake factory / buffer.
           factories.add(self.client_factories[None])
         else:
-          # Else we take the replica with the smallest queue size.
+          # Else we take the replica with the smallest backlog score,
+          # i.e. the lowest estimated drain time given its own queue
+          # depth and observed send rate.
           key = d[0:2]  # Take only host:port, not instance.
-          factories.add(min(self.pooled_factories[key], key=lambda f: f.queueSize))
+          factories.add(min(self.pooled_factories[key], key=lambda f: f.backlogScore))
     return factories
 
   def sendDatapoint(self, metric, datapoint):
